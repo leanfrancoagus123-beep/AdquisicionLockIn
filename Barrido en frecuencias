@@ -1,0 +1,405 @@
+import pyvisa as visa
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+import os
+
+
+class SR830:
+    '''Clase para el manejo del amplificador Lock-in SR830 usando PyVISA'''
+
+    scale_values = (
+        2e-9, 5e-9, 10e-9, 20e-9, 50e-9, 100e-9, 200e-9, 500e-9, 1e-6,
+        2e-6, 5e-6, 10e-6, 20e-6, 50e-6, 100e-6, 200e-6, 500e-6, 1e-3,
+        2e-3, 5e-3, 10e-3, 20e-3, 50e-3, 100e-3, 200e-3, 500e-3, 1.0
+    )  # en V
+
+    time_constant_values = (
+        10e-6, 30e-6, 100e-6, 300e-6, 1e-3, 3e-3, 10e-3, 30e-3, 100e-3, 300e-3,
+        1e0, 3e0, 10e0, 30e0, 100e0, 300e0, 1e3, 3e3, 10e3, 30e3
+    )  # en s
+
+    def __init__(self, resource):
+        self._lockin = visa.ResourceManager().open_resource(resource)
+        self._lockin.timeout = 5000
+        self._lockin.write("*CLS")
+        self._lockin.write("LOCL 2")
+        time.sleep(0.5)
+        self._lockin.write("ICPL 1")  # Acoplamiento DC (1) fijo
+        self._lockin.write("IGND 1")  # Ground (1) para fijar referencia con SINE OUT
+        self._lockin.write("RMOD 0")  # 0 = High Reserve (máxima tolerancia contra OVLD)
+        self._lockin.write("OFLS 3")  # Filtro de 24 dB/oct (4 polos)
+        self._lockin.write("SYNC 1")  # Filtro sincrónico activo para bajas frecuencias
+
+        self._fmod_actual = None
+        self._slvl_actual = None
+
+        self.scale = self.get_scale()
+        self.time_constant = self.get_time_constant()
+
+    def __del__(self):
+        try:
+            self._lockin.write("LOCL 0")
+            self._lockin.close()
+        except Exception:
+            pass
+
+    def set_modo(self, modo):
+        '''0=A, 1=A-B, 2=I(1M), 3=I(100M)'''
+        self._lockin.write(f"ISRC {modo}")
+
+    def set_referencia(self, isIntern, freq, voltaje=0.4):
+        '''
+        Actualiza FMOD y SLVL solo si cambiaron respecto al estado previo,
+        evitando transitorios de tensión en SINE OUT al barrer frecuencia.
+        '''
+        if isIntern:
+            if self._fmod_actual != 1:
+                self._lockin.write("FMOD 1")
+                self._fmod_actual = 1
+            if self._slvl_actual != round(voltaje, 4):
+                self._lockin.write(f"SLVL {voltaje:.4f}")
+                self._slvl_actual = round(voltaje, 4)
+                time.sleep(0.3)
+            self._lockin.write(f"FREQ {freq:.4f}")
+        else:
+            if self._fmod_actual != 0:
+                self._lockin.write("FMOD 0")
+                self._fmod_actual = 0
+
+    def set_scale(self, scale_number):
+        self.scale = max(0, min(scale_number, len(self.scale_values) - 1))
+        self._lockin.write(f"SENS {self.scale}")
+        return self.scale
+
+    def get_scale(self):
+        self.scale = int(self._lockin.query_ascii_values("SENS ?")[0])
+        return self.scale
+
+    def set_time_constant(self, time_constant_number):
+        self.time_constant = max(0, min(time_constant_number, len(self.time_constant_values) - 1))
+        self._lockin.write(f"OFLT {self.time_constant}")
+        return self.time_constant
+
+    def get_time_constant(self):
+        self.time_constant = int(self._lockin.query_ascii_values("OFLT ?")[0])
+        return self.time_constant
+
+    def ajustar_time_constant_por_frecuencia(self, freq, n_periodos=5, min_tau=10e-3):
+        periodo = 1.0 / freq
+        tau_objetivo = max(n_periodos * periodo, min_tau)
+
+        indice_elegido = len(self.time_constant_values) - 1
+        for i, tau_disp in enumerate(self.time_constant_values):
+            if tau_disp >= tau_objetivo:
+                indice_elegido = i
+                break
+
+        if indice_elegido != self.time_constant:
+            self.set_time_constant(indice_elegido)
+
+        return self.time_constant_values[indice_elegido]
+
+    def get_all(self):
+        '''Devuelve [X, Y, R, Theta] simultáneamente'''
+        return self._lockin.query_ascii_values("SNAP? 1,2,3,4", separator=",")
+
+    def hay_overload(self, espera_limpieza=0.25):
+        '''
+        Limpia el registro LIAS? (que guarda saturaciones pasadas),
+        espera 'espera_limpieza' segundos y verifica si AHORA MISMO hay Overload
+        en la entrada/reserva (Bit 0 = 1) o en el filtro pasabajos (Bit 1 = 2).
+        '''
+        _ = self._lockin.query_ascii_values("LIAS?")[0]
+        time.sleep(espera_limpieza)
+        status = int(self._lockin.query_ascii_values("LIAS?")[0])
+        return bool(status & 3)
+
+    def asegurar_escala_sin_overload(self, espera_estabilizacion):
+        '''
+        Ajusta la escala evaluando |X| e |Y| (en lugar de R) y el registro de OVLD.
+        No sale hasta que el OVLD haya desaparecido, tanto |X| como |Y| estén dentro
+        de rango y el filtro haya esperado 'espera_estabilizacion' completo.
+        '''
+        tau_actual = self.time_constant_values[self.time_constant]
+        t_check_ovld = max(0.2, 2.0 * tau_actual)
+
+        # 1. Esperamos estabilización inicial tras el cambio de frecuencia
+        time.sleep(espera_estabilizacion)
+
+        # 2. Si hay OVLD o |X| o |Y| están saturando la escala actual, subimos hasta que desaparezca
+        while True:
+            ovld_activo = self.hay_overload(espera_limpieza=t_check_ovld)
+            x, y, _, _ = self.get_all()
+            max_xy = max(abs(x), abs(y))
+            fondo_actual = self.scale_values[self.scale]
+
+            if ovld_activo or max_xy > 0.75 * fondo_actual:
+                if self.scale < len(self.scale_values) - 1:
+                    print(
+                        f"  [!] OVLD en X/Y detectado en escala {fondo_actual:.1e} V "
+                        f"(|X|={abs(x):.2e} V, |Y|={abs(y):.2e} V) -> Subiendo escala..."
+                    )
+                    self.set_scale(self.scale + 1)
+                    time.sleep(espera_estabilizacion)
+                else:
+                    print("  [ALERTA CRÍTICA] Escala máxima (1.0 V) alcanzada y persiste el OVLD.")
+                    break
+            else:
+                break
+
+        # 3. Con la lectura ya sin OVLD, miramos |X| e |Y| para elegir la escala óptima
+        #    (Tanto |X| como |Y| deben ser <= 65% de la escala elegida)
+        x, y, _, _ = self.get_all()
+        max_xy = max(abs(x), abs(y))
+
+        escala_ideal = len(self.scale_values) - 1
+        for i, val_escala in enumerate(self.scale_values):
+            if max_xy <= 0.65 * val_escala:
+                escala_ideal = i
+                break
+
+        if escala_ideal != self.scale:
+            self.set_scale(escala_ideal)
+            time.sleep(espera_estabilizacion)
+
+        # 4. Barrera final obligatoria: verificamos ausencia de OVLD y que tanto |X| como |Y| <= 75% del fondo de escala
+        while True:
+            ovld_activo = self.hay_overload(espera_limpieza=t_check_ovld)
+            x, y, _, _ = self.get_all()
+            max_xy = max(abs(x), abs(y))
+            fondo_actual = self.scale_values[self.scale]
+
+            if (ovld_activo or max_xy > 0.75 * fondo_actual) and self.scale < len(self.scale_values) - 1:
+                print(
+                    f"  [!] Reajuste anti-OVLD por X/Y (|X|={abs(x):.2e} V, |Y|={abs(y):.2e} V): "
+                    f"subiendo de {fondo_actual:.1e} V a {self.scale_values[self.scale + 1]:.1e} V..."
+                )
+                self.set_scale(self.scale + 1)
+                time.sleep(espera_estabilizacion)
+            else:
+                break
+
+    def medir_con_estadistica_segura(self, espera_estabilizacion, n_muestras=10, dt_muestras=0.05):
+        '''
+        Adquiere las n_muestras verificando que no haya saltado ningún OVLD
+        ni que |X| o |Y| hayan superado el límite durante la adquisición.
+        '''
+        while True:
+            _ = self._lockin.query_ascii_values("LIAS?")[0]
+
+            datos = np.zeros((n_muestras, 4))
+            for i in range(n_muestras):
+                datos[i, :] = self.get_all()
+                if i < n_muestras - 1:
+                    time.sleep(dt_muestras)
+
+            status_durante_medicion = int(self._lockin.query_ascii_values("LIAS?")[0])
+            hubo_ovld_en_rafaga = bool(status_durante_medicion & 3)
+
+            escala_actual = self.scale_values[self.scale]
+            # datos[:, 0] es X, datos[:, 1] es Y
+            max_xy_rafaga = np.max(np.abs(datos[:, :2]))
+            hubo_saturacion_xy = max_xy_rafaga > 0.85 * escala_actual
+
+            if (hubo_ovld_en_rafaga or hubo_saturacion_xy) and self.scale < len(self.scale_values) - 1:
+                print(
+                    f"  [!] Pico de OVLD en X/Y durante la toma de muestras "
+                    f"(max(|X|,|Y|)={max_xy_rafaga:.2e} V). Subiendo escala y repitiendo punto..."
+                )
+                self.set_scale(self.scale + 1)
+                time.sleep(espera_estabilizacion)
+                continue
+
+            break
+
+        promedios = np.mean(datos, axis=0)
+        std_est = np.std(datos, axis=0, ddof=1)
+
+        escala_actual = self.scale_values[self.scale]
+        err_inst_V = 0.01 * np.abs(promedios[:3]) + 1e-4 * escala_actual
+        err_inst_Theta = 0.01
+
+        err_inst = np.array([err_inst_V[0], err_inst_V[1], err_inst_V[2], err_inst_Theta])
+        err_total = np.sqrt(std_est**2 + err_inst**2)
+
+        return promedios, std_est, err_total
+
+
+def graficar_resultados(datos_matriz, longitud_str, v_exc, ruta_guardado_png):
+    '''
+    Genera y guarda una figura con 4 subgráficos (R, X, Y, Theta) en función de la frecuencia.
+    datos_matriz columnas:
+    0:Freq, 1:err_Freq, 2:X, 3:err_X_tot, 4:Y, 5:err_Y_tot, 6:R, 7:err_R_tot, 8:Theta, 9:err_Theta_tot
+    '''
+    freq = datos_matriz[:, 0]
+    x_uV, err_x_uV = datos_matriz[:, 2] * 1e6, datos_matriz[:, 3] * 1e6
+    y_uV, err_y_uV = datos_matriz[:, 4] * 1e6, datos_matriz[:, 5] * 1e6
+    r_uV, err_r_uV = datos_matriz[:, 6] * 1e6, datos_matriz[:, 7] * 1e6
+    theta, err_theta = datos_matriz[:, 8], datos_matriz[:, 9]
+
+    fig, axs = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
+    etiqueta = f"L = {longitud_str} cm ($V_0$ = {v_exc} V)"
+
+    # 1. Gráfico de R (uV)
+    axs[0].errorbar(freq, r_uV, yerr=err_r_uV, fmt='-o', color='tab:blue', capsize=3, label=etiqueta)
+    axs[0].set_ylabel("R (µV)")
+    axs[0].set_title(f"Caracterización Lock-in - Longitud: {longitud_str} cm")
+    axs[0].legend(loc="best")
+
+    # 2. Gráfico de X (uV)
+    axs[1].errorbar(freq, x_uV, yerr=err_x_uV, fmt='-s', color='tab:green', capsize=3, label=etiqueta)
+    axs[1].set_ylabel("X (µV)")
+
+    # 3. Gráfico de Y (uV)
+    axs[2].errorbar(freq, y_uV, yerr=err_y_uV, fmt='-d', color='tab:purple', capsize=3, label=etiqueta)
+    axs[2].set_ylabel("Y (µV)")
+
+    # 4. Gráfico de Theta (deg)
+    axs[3].errorbar(freq, theta, yerr=err_theta, fmt='-^', color='tab:red', capsize=3, label=etiqueta)
+    axs[3].set_ylabel("Theta (deg)")
+    axs[3].set_xlabel("Frecuencia (Hz)")
+
+    for ax in axs:
+        ax.set_xscale("log")
+        ax.grid(True, which="both", linestyle="--", alpha=0.7)
+
+    plt.tight_layout()
+    plt.savefig(ruta_guardado_png, dpi=200)
+    print(f"Gráfico guardado en: {ruta_guardado_png}")
+    plt.show()
+
+
+if __name__ == "__main__":
+    # 1. Solicitud de longitud por consola (admite coma o punto)
+    while True:
+        entrada_longitud = input("Ingrese la longitud del alambre (ej. 25.5 o 25,5): ").strip()
+        longitud_limpia = entrada_longitud.replace(",", ".")
+        try:
+            longitud_float = float(longitud_limpia)
+            break
+        except ValueError:
+            print("  [Error] Ingrese un número válido (usando punto o coma para decimales).")
+
+    # 2. Selección del modo de entrada (A o AB)
+    while True:
+        entrada_modo = input("Ingrese el modo de entrada [A / AB] (Enter para A): ").strip().upper()
+        if entrada_modo in ("", "A", "0"):
+            modo_seleccionado = 0
+            etiqueta_modo = "A"
+            break
+        elif entrada_modo in ("AB", "A-B", "1"):
+            modo_seleccionado = 1
+            etiqueta_modo = "AB"
+            break
+        else:
+            print("  [Error] Opción inválida. Escriba A o AB.")
+
+    direccion_visa = 'GPIB0::8::INSTR'
+
+    try:
+        lockin = SR830(direccion_visa)
+        print("Conexión exitosa con el Lock-in.")
+    except Exception as e:
+        print(f"Error al conectar: {e}")
+        exit()
+
+    carpeta_destino = "Practica 3"
+    os.makedirs(carpeta_destino, exist_ok=True)
+
+    frec1 = 350       # en Hz
+    frec2 = 10**5      # en Hz (100 kHz)
+    hora_registro = time.strftime("%H-%M-%S")
+
+    # Nombre del archivo con el modo (A o AB) y la longitud al final
+    nombre_base = f"caracterizacion_inductancia_{etiqueta_modo}_{frec1}Hz_{frec2}Hz_{hora_registro}_{longitud_limpia}"
+    archivo_csv = os.path.join(carpeta_destino, f"{nombre_base}.csv")
+    archivo_png = os.path.join(carpeta_destino, f"{nombre_base}.png")
+
+    # Voltaje de referencia (máximo 1.0 V según guía)
+    voltaje_excitacion = 0.5
+    lockin.set_modo(modo_seleccionado)  # 0 = Entrada A, 1 = Entrada AB
+
+    # Arrancamos en 2 mV (índice 18) para evitar un transitorio gigante en el filtro de 24 dB/oct
+    lockin.set_scale(18)
+
+    N_PUNTOS = 35
+    frecuencias = np.logspace(np.log10(frec1), np.log10(frec2), N_PUNTOS)
+
+    N_PERIODOS_INTEGRACION = 5
+    # 10 constantes de tiempo para estabilizar el filtro de 4° orden (24 dB/oct) al 99%
+    MULTIPLO_ESPERA = 10
+    TAU_MINIMO = 10e-3
+    N_MUESTRAS_POR_PUNTO = 10
+
+    print(
+        f"\n--- Iniciando barrido ({frec1} Hz a {frec2} Hz) | "
+        f"Modo = {etiqueta_modo} (DC) | L = {longitud_limpia} | V_exc = {voltaje_excitacion} V ---"
+    )
+
+    encabezado = (
+        "Longitud,V_exc(V),Frecuencia(Hz),err_Freq(Hz),Tau(s),Escala(V),"
+        "X(V),err_X_est(V),err_X_tot(V),"
+        "Y(V),err_Y_est(V),err_Y_tot(V),"
+        "R(V),err_R_est(V),err_R_tot(V),"
+        "Theta(deg),err_Theta_est(deg),err_Theta_tot(deg)\n"
+    )
+
+    datos_para_grafico = []
+
+
+    with open(archivo_csv, 'w') as f:
+        f.write(encabezado)
+
+        for freq in frecuencias:
+            lockin.set_referencia(isIntern=True, freq=freq, voltaje=voltaje_excitacion)
+            err_freq = 25e-6 * freq + 30e-6
+
+            tau_actual = lockin.ajustar_time_constant_por_frecuencia(
+                freq,
+                n_periodos=N_PERIODOS_INTEGRACION,
+                min_tau=TAU_MINIMO
+            )
+
+            espera = max(0.25, MULTIPLO_ESPERA * tau_actual)
+
+            # 1. Estabiliza escala y filtro sin OVLD evaluando X e Y
+            lockin.asegurar_escala_sin_overload(espera)
+
+            # 2. Mide las 10 muestras espaciadas al menos 2*tau para reducir correlación
+            dt_muestras = max(0.03, 2.0 * tau_actual)
+            promedios, std_est, err_total = lockin.medir_con_estadistica_segura(
+                espera_estabilizacion=espera,
+                n_muestras=N_MUESTRAS_POR_PUNTO,
+                dt_muestras=dt_muestras
+            )
+            escala_actual = lockin.scale_values[lockin.scale]
+
+            x, y, r, theta = promedios
+            sx_est, sy_est, sr_est, stheta_est = std_est
+            sx_tot, sy_tot, sr_tot, stheta_tot = err_total
+
+            print(
+                f"F: {freq:7.1f} Hz | Tau: {tau_actual:5.3f} s | Esc: {escala_actual:5.1e} V | "
+                f"X: {x:+.3e}±{sx_est:.1e} V | Y: {y:+.3e}±{sy_est:.1e} V | "
+                f"R: {r:.4e}±{sr_est:.1e} V | Theta: {theta:6.2f}±{stheta_est:.3f}"
+            )
+
+            # Escritura de cada fila en el archivo CSV
+            fila = (
+                f"{longitud_limpia},{voltaje_excitacion},{freq:.6f},{err_freq:.6e},{tau_actual},{escala_actual},"
+                f"{x:.6e},{sx_est:.6e},{sx_tot:.6e},"
+                f"{y:.6e},{sy_est:.6e},{sy_tot:.6e},"
+                f"{r:.6e},{sr_est:.6e},{sr_tot:.6e},"
+                f"{theta:.4f},{stheta_est:.4f},{stheta_tot:.4f}\n"
+            )
+            f.write(fila)
+            f.flush()
+
+            datos_para_grafico.append([
+                freq, err_freq, x, sx_tot, y, sy_tot, r, sr_tot, theta, stheta_tot
+            ])
+
+    print(f"\nBarrido finalizado. Datos guardados en: {archivo_csv}")
+    datos_matriz = np.array(datos_para_grafico)
+    graficar_resultados(datos_matriz, longitud_limpia, voltaje_excitacion, archivo_png)
